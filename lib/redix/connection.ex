@@ -3,25 +3,29 @@ defmodule Redix.Connection do
 
   use Connection
 
-  alias Redix.Protocol
   alias Redix.Connection.Auth
-  alias Redix.Connection.PubSub
   require Logger
+
+  def tcp_error(conn, ref, reason), do: Connection.cast(conn, {:tcp_error, ref, reason})
+
+  def client_error(conn, ref), do: Connection.cast(conn, {:client_error, ref})
+
+  def done(conn, ref), do: Connection.cast(conn, {:done, ref})
 
   @type state :: %{}
 
   @initial_state %{
     socket: nil,
-    tail: "",
     opts: nil,
-    queue: :queue.new,
     reconnection_attempts: 0,
-    pubsub: false,
-    pubsub_clients: %{},
-    pubsub_waiting_for_subscription_ack: HashSet.new,
+    broker_monitor: nil,
+    client_ref: nil,
+    client_monitor: nil,
+    client_timer: nil
   }
 
   @default_timeout 5000
+  @default_broker Redix.Broker
 
   @socket_opts [:binary, active: false]
 
@@ -41,7 +45,7 @@ defmodule Redix.Connection do
     case :gen_tcp.connect(host, port, socket_opts, timeout) do
       {:ok, socket} ->
         setup_socket_buffers(socket)
-        Auth.auth_and_select_db(%{s | socket: socket, reconnection_attempts: 0})
+        handshake(%{s | socket: socket, reconnection_attempts: 0})
       {:error, reason} ->
         Logger.error "Error connecting to Redis (#{host_for_logging(s)}): #{inspect reason}"
         handle_connection_error(s, info, reason)
@@ -51,164 +55,111 @@ defmodule Redix.Connection do
   @doc false
   def disconnect(reason, s)
 
-  def disconnect(:stop, %{socket: nil} = s) do
-    {:stop, :normal, s}
-  end
-
-  def disconnect(:stop, %{socket: socket} = s) do
-    :gen_tcp.close(socket)
-    {:stop, :normal, %{s | socket: nil}}
-  end
-
-  def disconnect({:error, reason} = _error, %{queue: _queue} = s) do
-    Logger.error "Disconnected from Redis (#{host_for_logging(s)}): #{inspect reason}"
-
-    # TODO take care of all the waiting clients and possibly send messages to
-    # pubsub ones.
-
-    # Backoff with 0 ms as the backoff time to churn through all the commands in
-    # the mailbox before reconnecting.
-    s = %{s | socket: nil, queue: :queue.new, tail: ""}
-    backoff_or_stop(s, 0, reason)
-  end
-
-  @doc false
-  def handle_call(operation, from, s)
-
-  def handle_call(_operation, _from, %{socket: nil} = s) do
-    {:reply, {:error, :closed}, s}
-  end
-
-  def handle_call({:commands, _commands}, _from, %{pubsub: true} = s) do
-    {:reply, {:error, :pubsub_mode}, s}
-  end
-
-  def handle_call({:commands, commands}, from, s) do
-    s
-    |> enqueue({:commands, from, length(commands)})
-    |> send_noreply(Enum.map(commands, &Protocol.pack/1))
-  end
-
-  def handle_call({op, _channels, _receiver}, _from, %{pubsub: false} = s)
-      when op in [:unsubscribe, :punsubscribe] do
-    {:reply, {:error, :not_pubsub_mode}, s}
-  end
-
-  def handle_call({op, channels, receiver}, _from, s) when op in [:subscribe, :psubscribe] do
-    {s, channels_to_subscribe_to} = PubSub.subscribe(s, op, channels, receiver)
-
-    if channels_to_subscribe_to == [] do
-      {:reply, :ok, s}
-    else
-      cmd = [PubSub.op_to_command(op)|channels_to_subscribe_to] |> Protocol.pack
-      send_reply(s, cmd, :ok)
-    end
-  end
-
-  def handle_call({op, channels, receiver}, _from, s) when op in [:unsubscribe, :punsubscribe] do
-    {s, channels_to_unsubscribe_from} = PubSub.unsubscribe(s, op, channels, receiver)
-
-    if channels_to_unsubscribe_from == [] do
-      {:reply, :ok, s}
-    else
-      cmd = [PubSub.op_to_command(op)|channels_to_unsubscribe_from] |> Protocol.pack
-      send_reply(s, cmd, :ok)
-    end
-  end
-
-  def handle_call(:pubsub?, _from, s) do
-    {:reply, s.pubsub, s}
+  def disconnect(reason, %{socket: socket} = s) do
+    if socket, do: :gen_tcp.close(socket)
+    backoff_or_stop(%{s | socket: nil}, 0, {:shutdown, reason})
   end
 
   @doc false
   def handle_cast(operation, s)
 
+  def handle_cast({:done, ref}, %{client_ref: ref} = s)
+  when is_reference(ref) do
+    {:noreply, s |> client_done() |> broker_ask()}
+  end
+
+  def handle_cast({:tcp_error, ref, reason}, %{client_ref: ref} = s)
+  when is_reference(ref) do
+    Logger.error "Disconnected from Redis (#{host_for_logging(s)}): #{inspect reason}"
+    {:disconnect, {:tcp_error, reason}, client_done(s)}
+  end
+
+  def handle_cast({:client, ref}, %{client_ref: ref} = s)
+  when is_reference(ref) do
+    {:disconnect, :client_error, client_done(s)}
+  end
+
   def handle_cast(:stop, s) do
-    {:disconnect, :stop, s}
+    {:stop, :normal, s}
+  end
+
+  def handle_cast(msg, %{client_ref: ref} = s) when elem(msg, 1) != ref do
+    {:noreply, s}
   end
 
   @doc false
   def handle_info(msg, s)
 
-  def handle_info({:tcp, socket, data}, %{socket: socket} = s) do
-    :ok = :inet.setopts(socket, active: :once)
-    s = new_data(s, s.tail <> data)
+  def handle_info({mon, msg}, %{broker_monitor: mon} = s) when is_reference(mon) do
+    handle_broker_msg(msg, s)
+  end
+
+  def handle_info({:DOWN, mon, _, _, reason},
+                  %{broker_monitor: mon} = s) when is_reference(mon) do
+    {:stop, {:shutdown, {:broker_terminated, reason}}, s}
+  end
+
+  def handle_info({:DOWN, mon, _, _, reason},
+                  %{client_monitor: mon} = s) when is_reference(mon) do
+    {:disconnect, {:client_terminated, reason}, client_done(%{s | client_monitor: nil})}
+  end
+
+  def handle_info({:timeout, timer, ref}, %{client_timer: timer, client_ref: ref} = s)
+  when is_reference(timer) do
+    {:disconnect, :client_timeout, client_done(%{s | client_timer: nil})}
+  end
+
+  def handle_info(_, s) do
     {:noreply, s}
-  end
-
-  def handle_info({:tcp_closed, socket}, %{socket: socket} = s) do
-    {:disconnect, {:error, :tcp_closed}, s}
-  end
-
-  def handle_info({:tcp_error, socket, reason}, %{socket: socket} = s) do
-    {:disconnect, {:error, reason}, s}
-  end
-
-  def handle_info({:DOWN, _ref, :process, _pid, _reason}, _s) do
-    # TODO
   end
 
   ## Helper functions
 
-  defp new_data(s, <<>>) do
-    %{s | tail: <<>>}
-  end
-
-  defp new_data(%{pubsub: false} = s, data) do
-    # We're not in pubsub mode, so we're sure there has to be a pending request
-    # in the queue.
-    {{:value, {:commands, _, _} = queue_el}, new_queue} = :queue.out(s.queue)
-    new_response_to_commands(s, data, queue_el, new_queue)
-  end
-
-  defp new_data(%{pubsub: true} = s, data) do
-    # This connection has received a (p)subscribe message and entered pubsub
-    # mode, but there could still be commands waiting for a response in the
-    # queue. If there are, do what new_data does when pubsub is false. If there
-    # aren't, do the pubsub thing.
-    case :queue.out(s.queue) do
-      {{:value, {:commands, _, _} = queue_el}, new_queue} ->
-        new_response_to_commands(s, data, queue_el, new_queue)
-      _ ->
-        case Protocol.parse(data) do
-          {:ok, resp, rest} ->
-            s |> PubSub.handle_message(resp) |> new_data(rest)
-          {:error, :incomplete} ->
-            %{s | tail: data}
-        end
+  defp handshake(s) do
+    case Auth.auth_and_select_db(s) do
+      {:ok, s}             -> {:ok, broker_ask(s)}
+      {:stop, _, _} = stop -> stop
     end
   end
 
-  defp new_response_to_commands(s, data, {:commands, from, ncommands}, new_queue) do
-    case Protocol.parse_multi(data, ncommands) do
-      {:ok, resp, rest} ->
-        Connection.reply(from, format_resp(resp))
-        s = %{s | queue: new_queue}
-        new_data(s, rest)
-      {:error, :incomplete} ->
-        %{s | tail: data}
-    end
+  defp broker_ask(%{client_ref: nil, broker_monitor: nil, opts: opts,
+                    socket: socket} = s) do
+    broker = opts[:broker] || @default_broker
+    {:await, mon, _} = :sbroker.async_ask_r(broker, {self(), socket})
+    %{s | broker_monitor: mon}
   end
 
-  defp send_noreply(%{socket: socket} = s, data) do
-    case :gen_tcp.send(socket, data) do
-      :ok                       -> {:noreply, s}
-      {:error, _reason} = error -> {:disconnect, error, s}
-    end
+  defp handle_broker_msg({:go, ref, {client, timeout}, _, _},
+                         %{client_ref: nil, broker_monitor: mon} = s) do
+    client_mon = Process.monitor(client)
+    if timeout != :infinity, do: timer = :erlang.start_timer(timeout, self(), ref)
+    Process.demonitor(mon, [:flush])
+    s = %{s | client_monitor: client_mon, client_ref: ref, client_timer: timer,
+              broker_monitor: nil}
+    {:noreply, s}
   end
 
-  defp send_reply(%{socket: socket} = s, data, reply) do
-    case :gen_tcp.send(socket, data) do
-      :ok                       -> {:reply, reply, s}
-      {:error, _reason} = error -> {:disconnect, error, s}
-    end
+  defp handle_broker_msg({:drop, _},
+                         %{client_ref: nil, broker_monitor: mon} = s) do
+    Process.demonitor(mon, [:flush])
+    {:disconnect, :broker_drop, %{s | broker_monitor: nil}}
   end
 
-  # Enqueues `val` or `vals` in the state.
-  defp enqueue(%{queue: queue} = s, vals) when is_list(vals),
-    do: %{s | queue: :queue.join(queue, :queue.from_list(vals))}
-  defp enqueue(%{queue: queue} = s, val),
-    do: %{s | queue: :queue.in(val, queue)}
+  defp client_done(%{client_monitor: mon, client_timer: timer} = s) do
+    if mon, do: Process.demonitor(mon, [:flush])
+    if timer, do: cancel_timer(timer)
+    %{s | client_ref: nil, client_monitor: nil, client_timer: nil}
+  end
+
+  defp cancel_timer(timer) do
+    unless :erlang.cancel_timer(timer) do
+      receive do
+        {:timeout, ^timer, _} -> :ok
+      after
+        0 -> raise "timer #{inspect timer} does not exist"
+      end
+    end
+  end
 
   # Extracts the TCP connection options (host, port and socket opts) from the
   # given `opts`.
@@ -229,9 +180,6 @@ defmodule Redix.Connection do
     buffer = buffer |> max(sndbuf) |> max(recbuf)
     :ok = :inet.setopts(socket, [buffer: buffer])
   end
-
-  defp format_resp(%Redix.Error{} = err), do: {:error, err}
-  defp format_resp(resp), do: {:ok, resp}
 
   defp host_for_logging(%{opts: opts} = _s) do
     "#{opts[:host]}:#{opts[:port]}"

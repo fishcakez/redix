@@ -32,7 +32,11 @@ defmodule Redix.Mixfile do
   end
 
   def application do
-    [applications: [:logger, :connection]]
+    [applications: [:logger, :connection, :sbroker],
+     mod: {Redix.App, []},
+     env: [broker_client_queue: {:sbroker_timeout_queue, {:out, 5_000_000, :drop, 1024}},
+           broker_worker_queue: {:sbroker_timeout_queue, {:out, 30_000_000, :drop, :infinity}},
+           broker_timeout: 200]]
   end
 
   defp package do
@@ -46,6 +50,7 @@ defmodule Redix.Mixfile do
   defp deps do
     [
       {:connection, "~> 1.0.0-rc.1"},
+      {:sbroker, "~> 0.7"},
       {:dialyze, "~> 0.2", only: :dev},
       {:benchfella, github: "alco/benchfella", only: :bench},
       {:redo, github: "heroku/redo", only: :bench},

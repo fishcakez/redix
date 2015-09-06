@@ -118,14 +118,17 @@ defmodule Redix do
   @type command :: [binary]
   @type pubsub_recipient :: pid | port | atom | {atom, node}
 
+  @default_broker Redix.Broker
+
   @default_opts [
     host: 'localhost',
     port: 6379,
     socket_opts: [],
+    broker: @default_broker,
     backoff: 2000,
   ]
 
-  @redis_opts ~w(host port password database)a
+  @redis_opts ~w(host port password database broker)a
 
   @default_timeout 5000
 
@@ -193,6 +196,8 @@ defmodule Redix do
       reconnection attempts that the Redix process is allowed to make. When the
       Redix process "consumes" all the reconnection attempts allowed to it, it
       will exit with the original error's reason.
+    * `:broker` - (`:sbroker.broker`) the `:sbroker` to match clients and
+      connections with. Defaults to `@default_broker`.
 
   In addition to these options, all options accepted by `GenServer.start_link/3`
   are forwarded to it. For example, a Redix connection can be registered with a
@@ -264,10 +269,10 @@ defmodule Redix do
   end
 
   @doc """
-  Issues a command on the Redis server.
+  Issues a command to a Redis server (via a broker).
 
-  This function sends `command` to the Redis server and returns the response
-  returned by Redis. `pid` must be the pid of a Redix connection. `command` must
+  This function sends `command` to a Redis server and returns the response
+  returned by Redis. `pid` must be the pid of an `:sbroker`. `command` must
   be a list of strings making up the Redis command and its arguments.
 
   The return value is `{:ok, response}` if the request is successful and the
@@ -277,25 +282,25 @@ defmodule Redix do
 
   ## Examples
 
-      iex> Redix.command(conn, ["SET", "mykey", "foo"])
+      iex> Redix.command(["SET", "mykey", "foo"])
       {:ok, "OK"}
-      iex> Redix.command(conn, ["GET", "mykey"])
+      iex> Redix.command(["GET", "mykey"])
       {:ok, "foo"}
 
-      iex> Redix.command(conn, ["INCR", "mykey"])
+      iex> Redix.command(["INCR", "mykey"])
       {:error, "ERR value is not an integer or out of range"}
 
   If Redis goes down (before a reconnection happens):
 
-      iex> Redix.command(conn, ["GET", "mykey"])
+      iex> Redix.command(["GET", "mykey"])
       {:error, :closed}
 
   """
-  @spec command(GenServer.server, command, Keyword.t) ::
+  @spec command(:sbroker.broker, command, Keyword.t) ::
     {:ok, Redix.Protocol.redis_value} |
     {:error, atom | Redix.Error.t}
-  def command(conn, args, opts \\ []) do
-    case pipeline(conn, [args], opts) do
+  def command(broker \\ @default_broker, args, opts \\ []) do
+    case pipeline(broker, [args], opts) do
       {:ok, [%Redix.Error{} = error]} ->
         {:error, error}
       {:ok, [resp]} ->
@@ -306,7 +311,7 @@ defmodule Redix do
   end
 
   @doc """
-  Issues a command on the Redis server, raising if there's an error.
+  Issues a command on a Redis server (via a broker), raising if there's an error.
 
   This function works exactly like `command/3` but:
 
@@ -321,21 +326,21 @@ defmodule Redix do
 
   ## Examples
 
-      iex> Redix.command!(conn, ["SET", "mykey", "foo"])
+      iex> Redix.command!(["SET", "mykey", "foo"])
       "OK"
 
-      iex> Redix.command!(conn, ["INCR", "mykey"])
+      iex> Redix.command!(["INCR", "mykey"])
       ** (Redix.Error) ERR value is not an integer or out of range
 
   If Redis goes down (before a reconnection happens):
 
-      iex> Redix.command!(conn, ["GET", "mykey"])
+      iex> Redix.command!(["GET", "mykey"])
       ** (Redix.ConnectionError) :closed
 
   """
-  @spec command!(GenServer.server, command, Keyword.t) :: Redix.Protocol.redis_value
-  def command!(conn, args, opts \\ []) do
-    case command(conn, args, opts) do
+  @spec command!(:sbroker.broker, command, Keyword.t) :: Redix.Protocol.redis_value
+  def command!(broker \\ @default_broker, args, opts \\ []) do
+    case command(broker, args, opts) do
       {:ok, resp} ->
         resp
       {:error, %Redix.Error{} = error} ->
@@ -346,7 +351,7 @@ defmodule Redix do
   end
 
   @doc """
-  Issues a pipeline of commands on the Redis server.
+  Issues a pipeline of commands on a Redis server (via a broker).
 
   `commands` must be a list of commands, where each command is a list of strings
   making up the command and its arguments. The commands will be sent as a single
@@ -364,27 +369,35 @@ defmodule Redix do
 
   ## Examples
 
-      iex> Redix.pipeline(conn, [~w(INCR mykey), ~w(INCR mykey), ~w(DECR mykey)])
+      iex> Redix.pipeline([~w(INCR mykey), ~w(INCR mykey), ~w(DECR mykey)])
       {:ok, [1, 2, 1]}
 
-      iex> Redix.pipeline(conn, [~w(SET k foo), ~w(INCR k), ~(GET k)])
+      iex> Redix.pipeline([~w(SET k foo), ~w(INCR k), ~(GET k)])
       {:ok, ["OK", %Redix.Error{message: "ERR value is not an integer or out of range"}, "foo"]}
 
   If Redis goes down (before a reconnection happens):
 
-      iex> Redix.pipeline(conn, [~w(SET mykey foo), ~w(GET mykey)])
+      iex> Redix.pipeline([~w(SET mykey foo), ~w(GET mykey)])
       {:error, :closed}
 
   """
-  @spec pipeline(GenServer.server, [command], Keyword.t) ::
+  @spec pipeline(:sbroker.broker, [command], Keyword.t) ::
     {:ok, [Redix.Protocol.redis_value]} |
     {:error, atom}
-  def pipeline(conn, commands, opts \\ []) do
-    Connection.call(conn, {:commands, commands}, opts[:timeout] || @default_timeout)
+  def pipeline(broker \\ @default_broker, commands, opts \\ []) do
+    timeout = opts[:timeout] || @default_timeout
+    ncommands = length(commands)
+    data = Enum.reduce(commands, [], &[&2 | Redix.Protocol.pack(&1)])
+    case :sbroker.ask(broker, {self(), timeout}) do
+      {:go, ref, {conn, socket}, _, _} ->
+        pipeline(conn, ref, socket, data, ncommands)
+      {:drop, _} ->
+        {:error, :closed}
+    end
   end
 
   @doc """
-  Issues a pipeline of commands to the Redis server, raising if there's an error.
+  Issues a pipeline of commands to a Redis server (via the broker), raising if there's an error.
 
   This function works similarly to `pipeline/3`, except:
 
@@ -401,21 +414,21 @@ defmodule Redix do
 
   ## Examples
 
-      iex> Redix.pipeline!(conn, [~w(INCR mykey), ~w(INCR mykey), ~w(DECR mykey)])
+      iex> Redix.pipeline!([~w(INCR mykey), ~w(INCR mykey), ~w(DECR mykey)])
       [1, 2, 1]
 
-      iex> Redix.pipeline!(conn, [~w(SET k foo), ~w(INCR k), ~(GET k)])
+      iex> Redix.pipeline!([~w(SET k foo), ~w(INCR k), ~(GET k)])
       ["OK", %Redix.Error{message: "ERR value is not an integer or out of range"}, "foo"]
 
   If Redis goes down (before a reconnection happens):
 
-      iex> Redix.pipeline!(conn, [~w(SET mykey foo), ~w(GET mykey)])
+      iex> Redix.pipeline!([~w(SET mykey foo), ~w(GET mykey)])
       ** (Redix.ConnectionError) :closed
 
   """
-  @spec pipeline!(GenServer.server, [command], Keyword.t) :: [Redix.Protocol.redis_value]
-  def pipeline!(conn, commands,  opts \\ []) do
-    case pipeline(conn, commands, opts) do
+  @spec pipeline!(:sbroker.broker, [command], Keyword.t) :: [Redix.Protocol.redis_value]
+  def pipeline!(broker \\ @default_broker, commands,  opts \\ []) do
+    case pipeline(broker, commands, opts) do
       {:ok, resp} ->
         resp
       {:error, error} ->
@@ -582,6 +595,46 @@ defmodule Redix do
   @spec pubsub?(GenServer.server, Keyword.t) :: boolean
   def pubsub?(conn, opts \\ []) do
     Connection.call(conn, :pubsub?, opts[:timeout] || @default_timeout)
+  end
+
+  defp pipeline(conn, ref, socket, data, ncommands) do
+    try do
+      pipeline_send(socket, data, ncommands)
+    else
+      {:ok, _} = ok ->
+        Redix.Connection.done(conn, ref)
+        ok
+      {:error, reason} = tcp_error ->
+         Redix.Connection.tcp_error(conn, ref, reason)
+         tcp_error
+    catch
+      class, reason ->
+        stack = System.stacktrace()
+        Redix.Connection.client_error(conn, ref)
+        :erlang.raise(class, reason, stack)
+    end
+  end
+
+  defp pipeline_send(socket, data, ncommands) do
+    case :gen_tcp.send(socket, data) do
+      :ok                     -> pipeline_recv(socket, ncommands)
+      {:error, _} = tcp_error -> tcp_error
+    end
+  end
+
+  defp pipeline_recv(socket, ncommands, buffer \\ <<>>) do
+    case :gen_tcp.recv(socket, 0) do
+      {:ok, data} ->
+        data = buffer <> data
+        case Redix.Protocol.parse_multi(data, ncommands) do
+          {:ok, values, ""} ->
+            {:ok, values}
+          {:error, :incomplete} ->
+            pipeline_recv(socket, ncommands, data)
+        end
+      {:error, _} = tcp_error ->
+        tcp_error
+    end
   end
 
   defp merge_with_default_opts(opts) do
