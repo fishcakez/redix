@@ -153,12 +153,13 @@ passive(Type, Event, Data) ->
 
 active(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
        #data{broker_ref=BRef, mod=Mod, buffer=Buffer, socket=Socket} = Data) ->
+    Client = start_client(Ref, Pid, Timeout, SojournTime),
     try Mod:pacify(Buffer, Socket) of
         Result ->
-            handle_pacify(Result, Ref, Pid, Timeout, SojournTime, Data)
+            handle_pacify(Result, Client, Data)
     catch
         throw:Result ->
-            handle_pacify(Result, Ref, Pid, Timeout, SojournTime, Data)
+            handle_pacify(Result, Client, Data)
     end;
 active(Type, Event, Data) ->
     handle_event(Type, Event, active, Data).
@@ -482,12 +483,16 @@ handle_active({close, Reason}, Data) ->
 handle_active(Other, _) ->
     exit({bad_return_value, Other}).
 
-handle_pacify({passive, NBuffer}, Ref, Pid, Timeout, SojournTime, Data) ->
-    handle_go(Ref, Pid, Timeout, SojournTime, Data#data{buffer=NBuffer});
-handle_pacify({close, Reason}, Ref, Pid, _, _, Data) ->
-    closed_send(Ref, Pid),
+handle_pacify({passive, NBuffer}, #client{ref=Ref} = Client,
+              #data{mode=Mode, broker=Broker} = Data) ->
+    continue(Client, Mode, Broker, NBuffer),
+    NData = Data#data{send=Client, recv=Client, broker_ref=Ref,
+                      buffer=undefined},
+    {next_state, go_next_state(Mode), NData};
+handle_pacify({close, Reason}, Client, Data) ->
+    closed_send(Client),
     {next_state, closing, Data, close_next(Reason)};
-handle_pacify(Other, _, _, _, _, _) ->
+handle_pacify(Other, _, _) ->
     exit({bad_return_value, Other}).
 
 handle_go(Ref, Pid, Timeout, SojournTime,
