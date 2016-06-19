@@ -8,7 +8,8 @@
 
 -export([init/1,
          backoff/3,
-         await/3,
+         passive/3,
+         active/3,
          half_duplex/3,
          semi_duplex/3,
          full_duplex/3,
@@ -29,6 +30,28 @@
       Info :: term(),
       Buffer :: term(),
       Socket :: term(),
+      Reason :: term().
+
+-callback activate(Buffer, Socket) ->
+    {active | passive, NBuffer} | {close, Reason} when
+      Buffer :: term(),
+      Socket :: term(),
+      NBuffer :: term(),
+      Reason :: term().
+
+-callback data(Data, Buffer, Socket) ->
+    {active | passive, NBuffer} | {close, Reason} when
+      Data :: term(),
+      Buffer :: term(),
+      Socket :: term(),
+      NBuffer :: term(),
+      Reason :: term().
+
+-callback pacify(Buffer, Socket) ->
+    {passive, NBuffer} | {close, Reason} when
+      Buffer :: term(),
+      Socket :: term(),
+      NBuffer :: term(),
       Reason :: term().
 
 -callback send(Req, Socket) ->
@@ -62,7 +85,7 @@
       Reason :: term(),
       Socket :: term().
 
--optional_callbacks([send_recv/3, recv/3]).
+-optional_callbacks([data/3, pacify/2, send_recv/3, recv/3]).
 
 -record(client, {ref :: reference(),
                  pid :: pid(),
@@ -113,26 +136,39 @@ backoff(internal, connect, #data{mod=Mod, info=Info} = Data) ->
             handle_connect(Result, Data)
     end.
 
-await(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
-      #data{broker_ref=BRef, mode=Mode, broker=Broker, buffer=Buffer} = Data) ->
-    continue(Pid, Ref, Mode, Broker, Buffer),
-    Client = start_client(Ref, Pid, Timeout, SojournTime),
-    NData = Data#data{broker_ref=Ref, send=Client, recv=Client,
-                      buffer=undefined},
-    case Mode of
-        half_duplex ->
-            {next_state, half_duplex, NData};
-        full_duplex ->
-            {next_state, semi_duplex, NData}
+passive(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
+        #data{broker_ref=BRef} = Data) ->
+    handle_go(Ref, Pid, Timeout, SojournTime, Data);
+passive(internal, activate,
+        #data{mod=Mod, buffer=Buffer, socket=Socket} = Data) ->
+    try Mod:activate(Buffer, Socket) of
+        Result ->
+            handle_active(Result, Data)
+    catch
+        throw:Result ->
+            handle_active(Result, Data)
     end;
-await(Type, Event, Data) ->
-    handle_event(Type, Event, await, Data).
+passive(Type, Event, Data) ->
+    handle_event(Type, Event, passive, Data).
+
+active(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
+       #data{broker_ref=BRef, mod=Mod, buffer=Buffer, socket=Socket} = Data) ->
+    try Mod:pacify(Buffer, Socket) of
+        Result ->
+            handle_pacify(Result, Ref, Pid, Timeout, SojournTime, Data)
+    catch
+        throw:Result ->
+            handle_pacify(Result, Ref, Pid, Timeout, SojournTime, Data)
+    end;
+active(Type, Event, Data) ->
+    handle_event(Type, Event, active, Data).
 
 half_duplex(cast, {done, Ref, Buffer},
         #data{send=#client{ref=Ref} = Client} = Data) ->
-    NData = ask_r(Data#data{send=undefined, recv=undefined, buffer=Buffer}),
+    NData = Data#data{send=undefined, recv=undefined, buffer=Buffer},
+    Result = ask_r(NData),
     cancel_client(Client),
-    {next_state, await, NData};
+    Result;
 half_duplex(cast, {close, Ref, Reason},
             #data{send=#client{ref=Ref} = Client} = Data) ->
     cancel_client(Client),
@@ -160,7 +196,7 @@ semi_duplex(cast, {done, Ref, Buffer},
             #data{send=#client{ref=Ref} = Client} = Data) ->
     cancel_client(Client),
     NData = Data#data{send=undefined, recv=undefined, buffer=Buffer},
-    {next_state, await, NData};
+    {next_state, passive, NData, activate_next()};
 semi_duplex(cast, {close, Ref, Reason},
             #data{send=#client{ref=Ref} = Client} = Data) ->
     cancel_client(Client),
@@ -420,18 +456,52 @@ close_next(Reason) ->
     {next_event, internal, {close, Reason}}.
 
 handle_connect({ok, Buffer, Socket}, Data) ->
-    NData = ask_r(Data#data{socket=Socket, buffer=Buffer}),
-    {next_state, await, NData};
+    ask_r(Data#data{socket=Socket, buffer=Buffer});
 handle_connect(Other, _) ->
     {stop, {bad_return_value, Other}}.
 
-ask_r(#data{send=undefined, mod=Mod, socket=Socket, broker=Broker,
-            broker_ref=BRef} = Data) ->
+ask_r(#data{send=undefined, recv=undefined, mod=Mod, socket=Socket,
+            broker=Broker} = Data) ->
     Conn = self(),
     Info = {Mod, Socket, Conn},
-    To = {Conn, BRef},
-    {await, BRef, Broker} = sbroker:async_ask_r(Broker, Info, To),
-    Data.
+    case sbroker:dynamic_ask_r(Broker, Info) of
+        {go, Ref, {Pid, Timeout}, _, SojournTime} ->
+            handle_go(Ref, Pid, Timeout, SojournTime, Data);
+        {await, BRef, Broker} ->
+            {next_state, passive, Data#data{broker_ref=BRef}, activate_next()}
+    end.
+
+activate_next() ->
+    {next_event, internal, activate}.
+
+handle_active({NState, NBuffer}, Data)
+  when NState == active; NState == passive ->
+    {next_state, NState, Data#data{buffer=NBuffer}};
+handle_active({close, Reason}, Data) ->
+    {next_state, closing, Data, close_next(Reason)};
+handle_active(Other, _) ->
+    exit({bad_return_value, Other}).
+
+handle_pacify({passive, NBuffer}, Ref, Pid, Timeout, SojournTime, Data) ->
+    handle_go(Ref, Pid, Timeout, SojournTime, Data#data{buffer=NBuffer});
+handle_pacify({close, Reason}, Ref, Pid, _, _, Data) ->
+    closed_send(Ref, Pid),
+    {next_state, closing, Data, close_next(Reason)};
+handle_pacify(Other, _, _, _, _, _) ->
+    exit({bad_return_value, Other}).
+
+handle_go(Ref, Pid, Timeout, SojournTime,
+          #data{mode=Mode, broker=Broker, buffer=Buffer} = Data) ->
+    continue(Pid, Ref, Mode, Broker, Buffer),
+    Client = start_client(Ref, Pid, Timeout, SojournTime),
+    NData = Data#data{send=Client, recv=Client, broker_ref=Ref,
+                      buffer=undefined},
+    {next_state, go_next_state(Mode), NData}.
+
+go_next_state(half_duplex) ->
+    half_duplex;
+go_next_state(full_duplex) ->
+    semi_duplex.
 
 handle_event(info, {Ref, {go, _,  {Pid, _}, _, _}}, State, Data)
   when is_reference(Ref) ->
@@ -444,7 +514,20 @@ handle_event(cast, {exception, Ref, Class, Reason, Stack}, _,
     {stop, {Class, Reason, Stack}};
 handle_event(cast, {exception, Ref, Class, Reason, Stack}, _,
              #data{recv=#client{ref=Ref}}) ->
-    {stop, {Class, Reason, Stack}}.
+    {stop, {Class, Reason, Stack}};
+handle_event(info, Info, active,
+             #data{mod=Mod, buffer=Buffer, socket=Socket} = Data) ->
+    try Mod:data(Info, Buffer, Socket) of
+        Result ->
+            handle_active(Result, Data)
+    catch
+        throw:Result ->
+            handle_active(Result, Data)
+    end;
+handle_event(info, Info, State, #data{mod=Mod} = Data) ->
+    error_logger:error_msg("Duplex connection ~p ~p discarding message: ~p",
+                           [Mod, self(), Info]),
+    {next_state, State, Data}.
 
 start_client(Ref, Pid, Timeout, SojournTime) ->
     MRef = monitor(process, Pid),

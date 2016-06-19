@@ -380,6 +380,50 @@ defmodule Redix.Alt do
     end
   end
 
+  def activate(<<>>, socket) do
+    case :inet.setopts(socket, [active: :once]) do
+      :ok              -> {:active, :active}
+      {:error, reason} -> {:close, reason}
+    end
+  end
+  def activate(buffer, _) when is_binary(buffer) do
+    {:passive, buffer}
+  end
+
+  def data({:tcp, socket, buffer}, :active, socket) do
+    {:passive, buffer}
+  end
+  def data({:tcp_closed, socket}, :active, socket) do
+    {:close, :closed}
+  end
+  def data({:tcp_error, socket, reason}, :active, socket) do
+    {:close, reason}
+  end
+  def data(_, :active, _) do
+    {:active, :active}
+  end
+
+  def pacify(:active, socket) do
+    result = :inet.setopts(socket, [active: false])
+    receive do
+      {:tcp, ^socket, data} when result == :ok ->
+        {:passive, data}
+      {:tcp, ^socket, _} ->
+        {:error, reason} = result
+        {:close, reason}
+      {:tcp_closed, ^socket} ->
+        {:close, :closed}
+      {:tcp_error, ^socket, reason} ->
+        {:close, reason}
+    after
+      0  ->
+        case result do
+          :ok              -> {:passive, <<>>}
+          {:error, reason} -> {:close, reason}
+        end
+    end
+  end
+
   def send({data, len}, socket) do
     case :gen_tcp.send(socket, data) do
       :ok             -> {:recv, len}
