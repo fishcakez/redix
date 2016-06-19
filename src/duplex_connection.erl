@@ -469,6 +469,7 @@ ask_r(#data{send=undefined, recv=undefined, mod=Mod, socket=Socket,
         {go, Ref, {Pid, Timeout}, _, SojournTime} ->
             handle_go(Ref, Pid, Timeout, SojournTime, Data);
         {await, BRef, Broker} ->
+            demonitor(BRef, [flush]),
             {next_state, passive, Data#data{broker_ref=BRef}, activate_next()}
     end.
 
