@@ -42,6 +42,7 @@ defmodule Redix.Mixfile do
   defp deps() do
     [{:connection, "~> 1.0.0"},
      {:sbroker, "~> 1.0.0-beta.2"},
+     {:backoff, "~> 1.1"},
      {:dialyze, "~> 0.2", only: :dev},
      {:markdown, github: "devinus/markdown", only: :docs},
      {:ex_doc, ">= 0.0.0", only: :docs}]

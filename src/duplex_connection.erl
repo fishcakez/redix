@@ -18,14 +18,15 @@
          terminate/3]).
 
 -callback init(Arg) ->
-    {Mode, Info, Broker} | {stop, Reason} | ignore when
+    {Mode, Info, Broker, Backoff} | {stop, Reason} | ignore when
       Arg :: term(),
       Mode :: half_duplex | full_duplex,
       Info :: term(),
       Broker :: sbroker:broker(),
+      Backoff :: backoff:backoff(),
       Reason :: term().
 
--callback connect(Info) ->
+-callback open(Info) ->
     {ok, Buffer, Socket} | {error, Reason} when
       Info :: term(),
       Buffer :: term(),
@@ -101,6 +102,8 @@
                broker :: pid() | {atom(), node()},
                broker_mon :: reference(),
                broker_ref=make_ref() :: reference(),
+               backoff :: backoff:backoff(),
+               backoff_timer=undefined :: reference() | undefined,
                send=undefined :: undefined | #client{} | unknown,
                recv=undefined :: undefined | #client{}}).
 
@@ -127,14 +130,19 @@ init({Mod, Args}) ->
             handle_init(Result, Mod, Args)
     end.
 
-backoff(internal, connect, #data{mod=Mod, info=Info} = Data) ->
-    try Mod:connect(Info) of
+backoff(internal, open, #data{mod=Mod, info=Info} = Data) ->
+    try Mod:open(Info) of
         Result ->
-            handle_connect(Result, Data)
+            handle_open(Result, Data)
     catch
         throw:Result ->
-            handle_connect(Result, Data)
-    end.
+            handle_open(Result, Data)
+    end;
+backoff(info, {timeout, TRef, _}, #data{backoff_timer=TRef} = Data)
+  when is_reference(TRef) ->
+    {keep_state, Data#data{backoff_timer=undefined}, open_next()};
+backoff(Type, Event, Data) ->
+    handle_event(Type, Event, backoff, Data).
 
 passive(info, {BRef, {go, Ref, {Pid, Timeout}, _, SojournTime}},
         #data{broker_ref=BRef} = Data) ->
@@ -268,7 +276,8 @@ closing(internal, {close, Reason},
                 ok
         end,
     NData = cancel_send(Data#data{socket=undefined}),
-    {next_state, backoff, NData, connect_next()}.
+    report(Reason, socket_closed, Data),
+    {next_state, backoff, NData, open_next()}.
 
 code_change(_, State, Data, _) ->
     {state_functions, State, Data}.
@@ -423,13 +432,13 @@ close(Conn, Ref, Reason) ->
 exception(Conn, Ref, Class, Reason, Stack) ->
     gen_statem:cast(Conn, {exception, Ref, Class, Reason, Stack}).
 
-handle_init({Mode, Info, Broker}, Mod, Args)
+handle_init({Mode, Info, Broker, Backoff}, Mod, Args)
   when Mode == half_duplex; Mode == full_duplex ->
     NBroker = lookup(Broker),
     MRef = monitor(process, NBroker),
     Data = #data{mod=Mod, args=Args, mode=Mode, broker=NBroker,
-                 broker_mon=MRef, info=Info},
-    {state_functions, backoff, Data, connect_next()};
+                 broker_mon=MRef, backoff=Backoff, info=Info},
+    {state_functions, backoff, Data, open_next()};
 handle_init({stop, _} = Stop, _, _) ->
     Stop;
 handle_init(ignore, _, _) ->
@@ -450,15 +459,21 @@ lookup({global, Name}) ->
 lookup({via, Mod, Name}) ->
     Mod:whereis_name(Name).
 
-connect_next() ->
-    {next_event, internal, connect}.
+open_next() ->
+    {next_event, internal, open}.
 
 close_next(Reason) ->
     {next_event, internal, {close, Reason}}.
 
-handle_connect({ok, Buffer, Socket}, Data) ->
-    ask_r(Data#data{socket=Socket, buffer=Buffer});
-handle_connect(Other, _) ->
+handle_open({ok, Buffer, Socket}, #data{backoff=Backoff} = Data) ->
+    {_, NBackoff} = backoff:succeed(Backoff),
+    ask_r(Data#data{socket=Socket, buffer=Buffer, backoff=NBackoff});
+handle_open({error, Reason}, #data{backoff=Backoff} = Data) ->
+    report(Reason, failed_to_open_socket, Data),
+    TRef = backoff:fire(Backoff),
+    {_, NBackoff} = backoff:fail(Backoff),
+    {keep_state, Data#data{backoff=NBackoff, backoff_timer=TRef}};
+handle_open(Other, _) ->
     {stop, {bad_return_value, Other}}.
 
 ask_r(#data{send=undefined, recv=undefined, mod=Mod, socket=Socket,
@@ -531,8 +546,8 @@ handle_event(info, Info, active,
             handle_active(Result, Data)
     end;
 handle_event(info, Info, State, #data{mod=Mod} = Data) ->
-    error_logger:error_msg("Duplex connection ~p ~p discarding message: ~p",
-                           [Mod, self(), Info]),
+    error_logger:error_msg("Duplex connection ~p discarding message: ~p",
+                           [{self(), Mod}, Info]),
     {next_state, State, Data}.
 
 start_client(Ref, Pid, Timeout, SojournTime) ->
@@ -592,3 +607,11 @@ continue(#client{ref=Ref, pid=Pid}, Mode, Broker, Buffer) ->
 continue(Pid, Ref, Mode, Broker, Buffer) ->
     _ = Pid ! {?MODULE, Ref, {Mode, Buffer, Broker}},
     ok.
+
+report(Reason, Context, #data{mod=Mod, socket=Socket, mode=Mode}) ->
+    Report = [{duplex_connection, {self(), Mod}},
+              {errorContext, Context},
+              {reason, Reason},
+              {socket, Socket},
+              {socket_mode, Mode}],
+    error_logger:error_report(duplex_connect_report, Report).

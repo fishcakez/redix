@@ -353,10 +353,11 @@ defmodule Redix.Alt do
   end
 
   def init({broker, opts}) do
-    {:full_duplex, opts, broker}
+    backoff = :backoff.init(1000, 20000, self(), __MODULE__)
+    {:full_duplex, opts, broker, backoff}
   end
 
-  def connect(opts) do
+  def open(opts) do
     case Redix.Utils.connect(opts) do
       {:ok, socket} ->
         :ok = :inet.setopts(socket, [active: false])
