@@ -539,6 +539,8 @@ handle_event(cast, {exception, Ref, Class, Reason, Stack}, _,
 handle_event(cast, {exception, Ref, Class, Reason, Stack}, _,
              #data{recv=#client{ref=Ref}}) ->
     {stop, {Class, Reason, Stack}};
+handle_event(info, {'DOWN', MRef, _, Pid, Reason}, _, #data{broker_mon=MRef}) ->
+    {stop, {'DOWN', Pid, Reason}};
 handle_event(info, Info, active,
              #data{mod=Mod, buffer=Buffer, socket=Socket} = Data) ->
     try Mod:data(Info, Buffer, Socket) of
