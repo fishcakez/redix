@@ -427,8 +427,8 @@ defmodule Redix.Alt do
 
   def send({data, len}, socket) do
     case :gen_tcp.send(socket, data) do
-      :ok             -> {:recv, len}
-      {:error, error} -> {:close, error}
+      :ok                   -> {:recv, len}
+      {:error, error} = err -> {:close, error, err}
     end
   end
 
@@ -439,7 +439,7 @@ defmodule Redix.Alt do
   def recv(len, buffer, socket) do
     case Redix.Protocol.parse_multi(buffer, len) do
       {:ok, resp, buffer} ->
-        {:result, resp, :binary.copy(buffer)}
+        {:result, {:ok, resp}, :binary.copy(buffer)}
       {:continuation, cont} ->
         recv_loop(:gen_tcp.recv(socket, 0, :infinity), cont, socket)
     end
@@ -448,13 +448,13 @@ defmodule Redix.Alt do
   defp recv_loop({:ok, data}, cont, socket) do
     case cont.(data) do
       {:ok, resp, buffer} ->
-        {:result, resp, :binary.copy(buffer)}
+        {:result, {:ok, resp}, :binary.copy(buffer)}
       {:continuation, cont} ->
         recv_loop(:gen_tcp.recv(socket, 0, :infinity), cont, socket)
     end
   end
-  defp recv_loop({:error, reason}, _, _) do
-    {:close, reason}
+  defp recv_loop({:error, reason} = err, _, _) do
+    {:close, reason, err}
   end
 
   def close(_, socket), do: :gen_tcp.close(socket)

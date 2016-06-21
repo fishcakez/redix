@@ -56,7 +56,7 @@
       Reason :: term().
 
 -callback send(Req, Socket) ->
-    {send_recv | recv, NReq} | {result, Result} | {close, Reason} when
+    {send_recv | recv, NReq} | {result, Result} | {close, Reason, Result} when
       Req :: term(),
       Socket :: term(),
       NReq :: term(),
@@ -64,7 +64,9 @@
       Reason :: term().
 
 -callback send_recv(Req, Buffer, Socket) ->
-    {recv, NReq, NBuffer} | {result, Result, NBuffer} | {close, Reason} when
+    {recv, NReq, NBuffer} |
+    {result, Result, NBuffer} |
+    {close, Reason, Result} when
       Req :: term(),
       Buffer :: term(),
       Socket :: term(),
@@ -74,7 +76,8 @@
       Reason :: term().
 
 -callback recv(Req, Buffer, Socket) ->
-    {result, Result, NBuffer} | {close, Reason} when
+    {result, Result, NBuffer} |
+    {close, Reason, Result} when
       Req :: term(),
       Buffer :: term(),
       Socket :: term(),
@@ -323,12 +326,12 @@ handle_send({Next, NReq}, Status, Mod, Socket, Conn, Ref)
         closed ->
             {error, closed}
     end;
-handle_send({close, Reason}, {Mode, _, _}, _, _, Conn, Ref)
+handle_send({close, Reason, Result}, {Mode, _, _}, _, _, Conn, Ref)
   when Mode == half_duplex; Mode == full_duplex ->
     close(Conn, Ref, Reason),
-    {error, Reason};
-handle_send({closed, Reason}, _, _, _, _, _) ->
-    {error, Reason};
+    Result;
+handle_send({closed, _, Result}, _, _, _, _, _) ->
+    Result;
 handle_send(Other, _, _, _, Conn, Ref) ->
     Reason = {bad_return_value, Other},
     try
@@ -387,16 +390,16 @@ handle(recv, Mod, Req, Buffer, Socket, Conn, Ref) ->
     end;
 handle(result, _, Result, Buffer, _, Conn, Ref) ->
     done(Conn, Ref, Buffer),
-    {ok, Result};
-handle(close, _, Reason, _, _, Conn, Ref) ->
+    Result;
+handle(close, _, Result, Reason, _, Conn, Ref) ->
     close(Conn, Ref, Reason),
-    {error, Reason}.
+    Result.
 
 handle_send_recv({Next, Req, Buffer}, Mod, Socket, Mode, Conn, Ref, Broker)
   when Next == recv; Next == result ->
     handle(Next, Mod, Req, Buffer, Socket, Mode, Conn, Ref, Broker);
-handle_send_recv({close, Reason}, Mod, Socket, _, Conn, Ref, _) ->
-    handle(close, Mod, Reason, undefined, Socket, Conn, Ref);
+handle_send_recv({close, Reason, Result}, Mod, Socket, _, Conn, Ref, _) ->
+    handle(close, Mod, Result, Reason, Socket, Conn, Ref);
 handle_send_recv(Other, _, _, _, Conn, Ref, _) ->
     Reason = {bad_return_value, Other},
     try
@@ -410,8 +413,8 @@ handle_send_recv(Other, _, _, _, Conn, Ref, _) ->
 
 handle_recv({result, Req, Buffer}, Mod, Socket, Conn, Ref) ->
     handle(result, Mod, Req, Buffer, Socket, Conn, Ref);
-handle_recv({close, Reason}, Mod, Socket, Conn, Ref) ->
-    handle(close, Mod, Reason, undefined, Socket, Conn, Ref);
+handle_recv({close, Reason, Result}, Mod, Socket, Conn, Ref) ->
+    handle(close, Mod, Result, Reason, Socket, Conn, Ref);
 handle_recv(Other, _, _, Conn, Ref) ->
     Reason = {bad_return_value, Other},
     try
